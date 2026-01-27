@@ -1,6 +1,6 @@
-module github.com/mikebarkmin/docker-volume-glusterfs
+module github.com/antoniospatera/docker-volume-glusterfs
 
-go 1.15
+go 1.21
 
 require (
 	github.com/Microsoft/go-winio v0.4.16 // indirect

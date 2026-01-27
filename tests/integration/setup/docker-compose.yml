@@ -1,0 +1,23 @@
+version: '3.2'
+
+# GlusterFS single node for local testing
+# For cluster/HA testing, deploy on multiple hosts (see docker-compose.cluster.yml)
+
+services:
+  gluster1:
+    image: gluster/gluster-centos:gluster4u0_centos7
+    container_name: gluster1
+    hostname: ${HOSTNAME:-localhost}
+    privileged: true
+    network_mode: host
+    volumes:
+      - gluster1_data:/glusterfs
+      - gluster1_etc:/etc/glusterfs
+      - gluster1_lib:/var/lib/glusterd
+      - gluster1_log:/var/log/glusterfs
+
+volumes:
+  gluster1_data:
+  gluster1_etc:
+  gluster1_lib:
+  gluster1_log:

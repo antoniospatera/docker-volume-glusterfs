@@ -1,0 +1,50 @@
+version: '3.2'
+
+# GlusterFS 2-node cluster for local HA testing
+# Uses a bridge network with fixed IPs accessible from host
+
+services:
+  gluster1:
+    image: gluster/gluster-centos:gluster4u0_centos7
+    container_name: gluster1
+    hostname: gluster1
+    privileged: true
+    volumes:
+      - gluster1_data:/glusterfs
+      - gluster1_etc:/etc/glusterfs
+      - gluster1_lib:/var/lib/glusterd
+      - gluster1_log:/var/log/glusterfs
+    networks:
+      glusternet:
+        ipv4_address: 172.28.0.10
+
+  gluster2:
+    image: gluster/gluster-centos:gluster4u0_centos7
+    container_name: gluster2
+    hostname: gluster2
+    privileged: true
+    volumes:
+      - gluster2_data:/glusterfs
+      - gluster2_etc:/etc/glusterfs
+      - gluster2_lib:/var/lib/glusterd
+      - gluster2_log:/var/log/glusterfs
+    networks:
+      glusternet:
+        ipv4_address: 172.28.0.11
+
+networks:
+  glusternet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  gluster1_data:
+  gluster1_etc:
+  gluster1_lib:
+  gluster1_log:
+  gluster2_data:
+  gluster2_etc:
+  gluster2_lib:
+  gluster2_log:

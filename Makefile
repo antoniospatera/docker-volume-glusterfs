@@ -1,4 +1,4 @@
-PLUGIN_NAME = mikebarkmin/glusterfs
+PLUGIN_NAME = antoniospatera/glusterfs
 PLUGIN_TAG ?= next
 
 all: clean rootfs create
@@ -31,3 +31,17 @@ enable:
 push:  clean rootfs create enable
 	@echo "### push plugin ${PLUGIN_NAME}:${PLUGIN_TAG}"
 	@docker plugin push ${PLUGIN_NAME}:${PLUGIN_TAG}
+
+test-setup:
+	@echo "### setting up GlusterFS test cluster"
+	@cd test && ./setup-gluster.sh
+
+test:
+	@echo "### running integration tests"
+	@cd test && ./run-tests.sh
+
+test-cleanup:
+	@echo "### cleaning up test environment"
+	@cd test && ./cleanup.sh
+
+test-all: test-setup test test-cleanup

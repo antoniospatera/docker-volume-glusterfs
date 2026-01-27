@@ -1,6 +1,6 @@
 {
   "description": "glusterFS plugin for Docker",
-  "documentation": "https://github.com/mikebarkmin/docker-volume-glusterfs",
+  "documentation": "https://github.com/antoniospatera/docker-volume-glusterfs",
   "entrypoint": ["/docker-volume-glusterfs"],
   "env": [
     {
@@ -31,16 +31,6 @@
       }
     ]
   },
-  "mounts": [
-    {
-      "destination": "/mnt/state",
-      "options": ["rbind"],
-      "name": "state",
-      "source": "/var/lib/docker/plugins/",
-      "settable": ["source"],
-      "type": "bind"
-    }
-  ],
   "network": {
     "type": "host"
   },

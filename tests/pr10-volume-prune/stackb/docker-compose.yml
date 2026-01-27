@@ -1,4 +1,4 @@
-version: '3.8'
+version: '2.4'
 services:
   alpine2:
     image: nginx:latest
@@ -8,7 +8,8 @@ services:
 
 volumes:
   test-volume:
-    driver: mikebarkmin/glusterfs:next
+    driver: antoniospatera/glusterfs:next
     driver_opts:
+      servers: "172.28.0.10,172.28.0.11"
       volname: gv0
-      subdir: foo
+      subdir: stackb-foo

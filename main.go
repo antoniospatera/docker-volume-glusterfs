@@ -22,7 +22,7 @@ import (
 const socketAddress = "/run/docker/plugins/glusterfs.sock"
 
 type glusterfsVolume struct {
-	connections      int
+	Connections      int `json:"connections"`
 	Name             string
 	Subdir           string
 	SubdirMountpoint string
@@ -46,8 +46,8 @@ func newGlusterfsDriver(root string, defaultServers string, defaultVolname strin
 	logrus.WithField("method", "new driver").Debug(root)
 
 	d := &glusterfsDriver{
-		root:           filepath.Join(root, "volumes"),
-		statePath:      filepath.Join(root, "state", "gfs-state.json"),
+		root:           root,
+		statePath:      filepath.Join(root, ".state", "gfs-state.json"),
 		volumes:        map[string]*glusterfsVolume{},
 		defaultVolname: defaultVolname,
 		defaultServers: defaultServers,
@@ -66,13 +66,76 @@ func newGlusterfsDriver(root string, defaultServers string, defaultVolname strin
 		}
 	}
 
+	// Cleanup orphan connections at startup
+	d.cleanup()
+
 	return d, nil
+}
+
+// cleanup synchronizes Connections counter with actual mount state
+func (d *glusterfsDriver) cleanup() {
+	d.Lock()
+	defer d.Unlock()
+
+	logrus.Info("cleanup: checking for orphan mounts and connections")
+
+	changed := false
+	for name, v := range d.volumes {
+		mounted := isMounted(v.Mountpoint)
+
+		if !mounted && v.Connections > 0 {
+			// Volume not mounted but connections > 0 → reset counter
+			logrus.WithField("volume", name).Warnf("cleanup: resetting orphan connections %d → 0", v.Connections)
+			v.Connections = 0
+			changed = true
+		}
+
+		if mounted && v.Connections == 0 {
+			// Volume mounted but connections = 0 → force unmount
+			logrus.WithField("volume", name).Warn("cleanup: unmounting orphan mount")
+			// unmountVolume doesn't access shared state, safe to call with lock held
+			if err := d.unmountVolume(v.Mountpoint); err != nil {
+				logrus.WithField("volume", name).Errorf("cleanup: failed to unmount orphan: %v", err)
+			}
+			changed = true
+		}
+	}
+
+	if changed {
+		d.saveStateUnlocked()
+	}
+
+	logrus.Info("cleanup: completed")
+}
+
+// saveStateUnlocked saves state without acquiring lock (caller must hold lock)
+func (d *glusterfsDriver) saveStateUnlocked() {
+	data, err := json.Marshal(d.volumes)
+	if err != nil {
+		logrus.WithField("statePath", d.statePath).Error(err)
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(d.statePath), 0755); err != nil {
+		logrus.WithField("savestate", d.statePath).Error(err)
+		return
+	}
+
+	if err := ioutil.WriteFile(d.statePath, data, 0644); err != nil {
+		logrus.WithField("savestate", d.statePath).Error(err)
+	}
 }
 
 func (d *glusterfsDriver) saveState() {
 	data, err := json.Marshal(d.volumes)
 	if err != nil {
 		logrus.WithField("statePath", d.statePath).Error(err)
+		return
+	}
+
+	// Ensure state directory exists
+	if err := os.MkdirAll(filepath.Dir(d.statePath), 0755); err != nil {
+		logrus.WithField("savestate", d.statePath).Error(err)
 		return
 	}
 
@@ -133,6 +196,16 @@ func (d *glusterfsDriver) Create(r *volume.CreateRequest) error {
 	return nil
 }
 
+// isMounted checks if a path is currently mounted by reading /proc/mounts
+func isMounted(target string) bool {
+	data, err := ioutil.ReadFile("/proc/mounts")
+	if err != nil {
+		logrus.WithField("method", "isMounted").Warnf("failed to read /proc/mounts: %v", err)
+		return false
+	}
+	return strings.Contains(string(data), target)
+}
+
 // https://socketloop.com/tutorials/golang-determine-if-directory-is-empty-with-os-file-readdir-function
 func IsDirEmpty(name string) (bool, error) {
 	f, err := os.Open(name)
@@ -162,8 +235,40 @@ func (d *glusterfsDriver) Remove(r *volume.RemoveRequest) error {
 		return logError("volume %s not found", r.Name)
 	}
 
-	if v.connections != 0 {
+	mounted := isMounted(v.Mountpoint)
+	logrus.WithField("volume", r.Name).Debugf("remove: mounted=%v, connections=%d", mounted, v.Connections)
+
+	// Sync connections with actual mount state before checking
+	if !mounted && v.Connections > 0 {
+		logrus.WithField("volume", r.Name).Warnf("volume not mounted but connections=%d, resetting", v.Connections)
+		v.Connections = 0
+		d.saveStateUnlocked()
+	}
+
+	// If mounted but connections > 0, try to unmount first
+	// This handles cases where Docker didn't properly call Unmount (container kill, crash, etc.)
+	if mounted && v.Connections > 0 {
+		logrus.WithField("volume", r.Name).Warnf("volume mounted with connections=%d, attempting unmount for removal", v.Connections)
+		if err := d.unmountVolume(v.Mountpoint); err != nil {
+			logrus.WithField("volume", r.Name).Warnf("unmount failed: %v, volume may still be in use", err)
+			return logError("volume %s is currently used by a container", r.Name)
+		}
+		// Unmount succeeded, reset connections
+		v.Connections = 0
+		d.saveStateUnlocked()
+		mounted = false
+	}
+
+	if v.Connections != 0 {
 		return logError("volume %s is currently used by a container", r.Name)
+	}
+
+	// Check if still mounted (orphan mount from crash/restart)
+	if mounted {
+		logrus.WithField("volume", r.Name).Warn("volume still mounted with 0 connections, forcing unmount")
+		if err := d.unmountVolume(v.Mountpoint); err != nil {
+			return logError("cannot remove volume %s: unmount failed: %v", r.Name, err)
+		}
 	}
 
 	empty, err := IsDirEmpty(v.Mountpoint)
@@ -209,7 +314,10 @@ func (d *glusterfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, 
 		return &volume.MountResponse{}, logError("volume %s not found", r.Name)
 	}
 
-	if v.connections == 0 {
+	// Check if already mounted (handles restart/crash recovery)
+	alreadyMounted := isMounted(v.Mountpoint)
+
+	if v.Connections == 0 && !alreadyMounted {
 		fi, err := os.Lstat(v.Mountpoint)
 		if os.IsNotExist(err) {
 			if err := os.MkdirAll(v.Mountpoint, 0755); err != nil {
@@ -226,9 +334,15 @@ func (d *glusterfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, 
 		if err := d.mountVolume(v); err != nil {
 			return &volume.MountResponse{}, logError(err.Error())
 		}
+	} else if alreadyMounted && v.Connections == 0 {
+		// Volume is mounted but counter is 0 (recovery from crash/restart)
+		logrus.WithField("volume", r.Name).Info("volume already mounted, recovering state")
+		// Ensure SubdirMountpoint is set
+		v.SubdirMountpoint = filepath.Join(v.Mountpoint, v.Subdir)
 	}
 
-	v.connections++
+	v.Connections++
+	d.saveState()
 
 	return &volume.MountResponse{Mountpoint: v.SubdirMountpoint}, nil
 }
@@ -243,15 +357,17 @@ func (d *glusterfsDriver) Unmount(r *volume.UnmountRequest) error {
 		return logError("volume %s not found", r.Name)
 	}
 
-	v.connections--
+	v.Connections--
 
-	if v.connections <= 0 {
+	if v.Connections <= 0 {
+		v.Connections = 0
 		if err := d.unmountVolume(v.Mountpoint); err != nil {
-			return logError(err.Error())
+			// Log error but don't fail - mount might already be gone
+			logrus.WithField("volume", r.Name).Warnf("unmount error (may be already unmounted): %v", err)
 		}
-		v.connections = 0
 	}
 
+	d.saveState()
 	return nil
 }
 
@@ -325,9 +441,32 @@ func (d *glusterfsDriver) mountVolume(v *glusterfsVolume) error {
 }
 
 func (d *glusterfsDriver) unmountVolume(target string) error {
-	cmd := fmt.Sprintf("umount %s", target)
-	logrus.Debug(cmd)
-	return exec.Command("sh", "-c", cmd).Run()
+	// Check if actually mounted
+	if !isMounted(target) {
+		logrus.WithField("target", target).Debug("not mounted, skipping unmount")
+		return nil
+	}
+
+	// Try normal unmount first
+	logrus.WithField("target", target).Debug("attempting unmount")
+	cmd := exec.Command("umount", target)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		logrus.WithField("target", target).Debug("unmount successful")
+		return nil
+	}
+
+	logrus.WithField("target", target).Warnf("normal unmount failed: %v (%s), trying lazy unmount", err, output)
+
+	// Fallback to lazy unmount
+	cmd = exec.Command("umount", "-l", target)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return logError("lazy unmount failed: %v (%s)", err, output)
+	}
+
+	logrus.WithField("target", target).Debug("lazy unmount successful")
+	return nil
 }
 
 func logError(format string, args ...interface{}) error {
@@ -341,7 +480,7 @@ func main() {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	d, err := newGlusterfsDriver("/mnt", os.Getenv("SERVERS"), os.Getenv("VOLNAME"))
+	d, err := newGlusterfsDriver("/mnt/volumes", os.Getenv("SERVERS"), os.Getenv("VOLNAME"))
 	if err != nil {
 		log.Fatal(err)
 	}
