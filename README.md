@@ -1,5 +1,9 @@
 # Docker volume plugin for GlusterFS
 
+![Docker Pulls](https://img.shields.io/docker/pulls/antoniospatera/glusterfs)
+![GitHub stars](https://img.shields.io/github/stars/antoniospatera/docker-volume-glusterfs)
+![License](https://img.shields.io/github/license/antoniospatera/docker-volume-glusterfs)
+
 This is a managed Docker volume plugin to allow Docker containers to access
 GlusterFS volumes. The GlusterFS client does not need to be installed on the
 host and everything is managed within the plugin.
