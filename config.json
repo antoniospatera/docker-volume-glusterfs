@@ -17,6 +17,11 @@
       "name": "VOLNAME",
       "settable": ["value"],
       "value": ""
+    },
+    {
+      "name": "CLEANUP_INTERVAL",
+      "settable": ["value"],
+      "value": "0"
     }
   ],
   "interface": {

@@ -20,6 +20,9 @@ docker plugin install --alias glusterfs antoniospatera/glusterfs SERVERS=<server
 
 # or to enable debug
 docker plugin install --alias glusterfs antoniospatera/glusterfs DEBUG=1
+
+# optional: enable periodic cleanup every 60 seconds (for heavy Swarm environments)
+docker plugin install --alias glusterfs antoniospatera/glusterfs CLEANUP_INTERVAL=60
 ```
 
 2 - Create a volume
@@ -152,6 +155,7 @@ The plugin automatically synchronizes the `Connections` counter with actual moun
 **Cleanup runs:**
 - At plugin startup
 - Before volume removal
+- Periodically, if `CLEANUP_INTERVAL` is set (value in seconds, default `0` = disabled)
 
 ```
 PLUGIN STARTUP
@@ -349,8 +353,17 @@ See [tests/integration/README.md](tests/integration/README.md) for detailed docu
 
 ## TODO
 
-- Add retry with exponential backoff before lazy unmount (handles temporary I/O errors)
-- Add optional periodic cleanup goroutine for heavy Swarm environments (configurable via `CLEANUP_INTERVAL` env)
+- ~Add retry with exponential backoff before lazy unmount (handles temporary I/O errors)~ ✅
+- ~Add optional periodic cleanup goroutine for heavy Swarm environments (configurable via `CLEANUP_INTERVAL` env)~ ✅
+- Add optional Prometheus metrics endpoint for monitoring (`METRICS_ENABLED`, `METRICS_PORT`)
+
+## Feedback
+
+If this plugin is useful to you, consider:
+
+- Giving it a star on [GitHub](https://github.com/antoniospatera/docker-volume-glusterfs)
+- Reporting issues or suggesting features via [GitHub Issues](https://github.com/antoniospatera/docker-volume-glusterfs/issues)
+- Contributing with pull requests
 
 ## LICENSE
 

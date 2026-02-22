@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/go-plugins-helpers/volume"
 	"github.com/sirupsen/logrus"
@@ -35,22 +36,24 @@ type glusterfsVolume struct {
 type glusterfsDriver struct {
 	sync.RWMutex
 
-	root           string
-	statePath      string
-	volumes        map[string]*glusterfsVolume
-	defaultVolname string
-	defaultServers string
+	root            string
+	statePath       string
+	volumes         map[string]*glusterfsVolume
+	defaultVolname  string
+	defaultServers  string
+	cleanupInterval time.Duration
 }
 
-func newGlusterfsDriver(root string, defaultServers string, defaultVolname string) (*glusterfsDriver, error) {
+func newGlusterfsDriver(root string, defaultServers string, defaultVolname string, cleanupInterval time.Duration) (*glusterfsDriver, error) {
 	logrus.WithField("method", "new driver").Debug(root)
 
 	d := &glusterfsDriver{
-		root:           root,
-		statePath:      filepath.Join(root, ".state", "gfs-state.json"),
-		volumes:        map[string]*glusterfsVolume{},
-		defaultVolname: defaultVolname,
-		defaultServers: defaultServers,
+		root:            root,
+		statePath:       filepath.Join(root, ".state", "gfs-state.json"),
+		volumes:         map[string]*glusterfsVolume{},
+		defaultVolname:  defaultVolname,
+		defaultServers:  defaultServers,
+		cleanupInterval: cleanupInterval,
 	}
 
 	data, err := ioutil.ReadFile(d.statePath)
@@ -106,6 +109,20 @@ func (d *glusterfsDriver) cleanup() {
 	}
 
 	logrus.Info("cleanup: completed")
+}
+
+func (d *glusterfsDriver) startPeriodicCleanup() {
+	if d.cleanupInterval == 0 {
+		return // disabled
+	}
+	ticker := time.NewTicker(d.cleanupInterval)
+	go func() {
+		for range ticker.C {
+			logrus.Info("periodic cleanup: running scheduled cleanup")
+			d.cleanup()
+		}
+	}()
+	logrus.Infof("periodic cleanup: enabled with interval %v", d.cleanupInterval)
 }
 
 // saveStateUnlocked saves state without acquiring lock (caller must hold lock)
@@ -441,26 +458,38 @@ func (d *glusterfsDriver) mountVolume(v *glusterfsVolume) error {
 }
 
 func (d *glusterfsDriver) unmountVolume(target string) error {
+	const maxRetries = 3
+	initialBackoff := 100 * time.Millisecond
+
 	// Check if actually mounted
 	if !isMounted(target) {
 		logrus.WithField("target", target).Debug("not mounted, skipping unmount")
 		return nil
 	}
 
-	// Try normal unmount first
-	logrus.WithField("target", target).Debug("attempting unmount")
-	cmd := exec.Command("umount", target)
-	output, err := cmd.CombinedOutput()
-	if err == nil {
-		logrus.WithField("target", target).Debug("unmount successful")
-		return nil
+	// Retry with exponential backoff
+	var lastErr error
+	backoff := initialBackoff
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		logrus.WithField("target", target).Debugf("unmount attempt %d/%d", attempt, maxRetries)
+		cmd := exec.Command("umount", target)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			logrus.WithField("target", target).Debug("unmount successful")
+			return nil
+		}
+		lastErr = fmt.Errorf("%v (%s)", err, output)
+		logrus.WithField("target", target).Warnf("unmount attempt %d/%d failed: %v", attempt, maxRetries, lastErr)
+		if attempt < maxRetries {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
 	}
 
-	logrus.WithField("target", target).Warnf("normal unmount failed: %v (%s), trying lazy unmount", err, output)
-
-	// Fallback to lazy unmount
-	cmd = exec.Command("umount", "-l", target)
-	output, err = cmd.CombinedOutput()
+	// All retries exhausted, fallback to lazy unmount
+	logrus.WithField("target", target).Warnf("all %d unmount attempts failed, trying lazy unmount", maxRetries)
+	cmd := exec.Command("umount", "-l", target)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return logError("lazy unmount failed: %v (%s)", err, output)
 	}
@@ -480,10 +509,21 @@ func main() {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	d, err := newGlusterfsDriver("/mnt/volumes", os.Getenv("SERVERS"), os.Getenv("VOLNAME"))
+	var cleanupInterval time.Duration
+	if envVal := os.Getenv("CLEANUP_INTERVAL"); envVal != "" {
+		secs, err := strconv.Atoi(envVal)
+		if err != nil || secs < 0 {
+			log.Fatalf("invalid CLEANUP_INTERVAL value %q: must be a non-negative integer (seconds)", envVal)
+		}
+		cleanupInterval = time.Duration(secs) * time.Second
+	}
+
+	d, err := newGlusterfsDriver("/mnt/volumes", os.Getenv("SERVERS"), os.Getenv("VOLNAME"), cleanupInterval)
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	d.startPeriodicCleanup()
 
 	h := volume.NewHandler(d)
 	u, _ := user.Lookup("root")

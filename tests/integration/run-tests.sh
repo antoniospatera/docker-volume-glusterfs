@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-PLUGIN_NAME="${PLUGIN_NAME:-antoniospatera/glusterfs:next}"
+PLUGIN_NAME="${PLUGIN_NAME:-antoniospatera/glusterfs:latest}"
 #SERVERS="${SERVERS:-$(hostname)}"
 SERVERS="${SERVERS:-172.28.0.10,172.28.0.11}"
 VOLNAME="${VOLNAME:-gv0}"
