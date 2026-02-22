@@ -22,6 +22,16 @@
       "name": "CLEANUP_INTERVAL",
       "settable": ["value"],
       "value": "0"
+    },
+    {
+      "name": "METRICS_ENABLED",
+      "settable": ["value"],
+      "value": "false"
+    },
+    {
+      "name": "METRICS_PORT",
+      "settable": ["value"],
+      "value": "9713"
     }
   ],
   "interface": {

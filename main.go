@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/antoniospatera/docker-volume-glusterfs/internal/metrics"
 	"github.com/docker/go-plugins-helpers/volume"
 	"github.com/sirupsen/logrus"
 )
@@ -42,9 +43,10 @@ type glusterfsDriver struct {
 	defaultVolname  string
 	defaultServers  string
 	cleanupInterval time.Duration
+	metrics         metrics.Recorder
 }
 
-func newGlusterfsDriver(root string, defaultServers string, defaultVolname string, cleanupInterval time.Duration) (*glusterfsDriver, error) {
+func newGlusterfsDriver(root string, defaultServers string, defaultVolname string, cleanupInterval time.Duration, rec metrics.Recorder) (*glusterfsDriver, error) {
 	logrus.WithField("method", "new driver").Debug(root)
 
 	d := &glusterfsDriver{
@@ -54,6 +56,7 @@ func newGlusterfsDriver(root string, defaultServers string, defaultVolname strin
 		defaultVolname:  defaultVolname,
 		defaultServers:  defaultServers,
 		cleanupInterval: cleanupInterval,
+		metrics:         rec,
 	}
 
 	data, err := ioutil.ReadFile(d.statePath)
@@ -71,6 +74,8 @@ func newGlusterfsDriver(root string, defaultServers string, defaultVolname strin
 
 	// Cleanup orphan connections at startup
 	d.cleanup()
+
+	d.metrics.SetVolumesTotal(len(d.volumes))
 
 	return d, nil
 }
@@ -106,6 +111,13 @@ func (d *glusterfsDriver) cleanup() {
 
 	if changed {
 		d.saveStateUnlocked()
+	}
+
+	// Resync metrics with actual state
+	d.metrics.SetVolumesTotal(len(d.volumes))
+	d.metrics.SetVolumesMounted(countMounted(d.volumes))
+	for name, v := range d.volumes {
+		d.metrics.SetVolumeConnections(name, v.Connections)
 	}
 
 	logrus.Info("cleanup: completed")
@@ -207,6 +219,8 @@ func (d *glusterfsDriver) Create(r *volume.CreateRequest) error {
 	v.Mountpoint = filepath.Join(d.root, fmt.Sprintf("%x/%x/%x", sha256.Sum256([]byte(v.Name)), sha256.Sum256([]byte(v.Volname)), sha256.Sum256([]byte(v.Subdir))))
 
 	d.volumes[r.Name] = v
+	d.metrics.SetVolumesTotal(len(d.volumes))
+	d.metrics.SetVolumeConnections(r.Name, 0)
 
 	d.saveState()
 
@@ -302,6 +316,8 @@ func (d *glusterfsDriver) Remove(r *volume.RemoveRequest) error {
 		return logError(err.Error())
 	}
 	delete(d.volumes, r.Name)
+	d.metrics.SetVolumesTotal(len(d.volumes))
+	d.metrics.RemoveVolumeConnections(r.Name)
 	d.saveState()
 	return nil
 }
@@ -348,9 +364,15 @@ func (d *glusterfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, 
 			return &volume.MountResponse{}, logError("%v already exist and it's not a directory", v.Mountpoint)
 		}
 
+		start := time.Now()
 		if err := d.mountVolume(v); err != nil {
+			d.metrics.ObserveMountDuration("mount", time.Since(start))
+			d.metrics.IncMountOps("mount", "error")
+			d.metrics.IncMountError(classifyError(err))
 			return &volume.MountResponse{}, logError(err.Error())
 		}
+		d.metrics.ObserveMountDuration("mount", time.Since(start))
+		d.metrics.IncMountOps("mount", "success")
 	} else if alreadyMounted && v.Connections == 0 {
 		// Volume is mounted but counter is 0 (recovery from crash/restart)
 		logrus.WithField("volume", r.Name).Info("volume already mounted, recovering state")
@@ -359,6 +381,8 @@ func (d *glusterfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, 
 	}
 
 	v.Connections++
+	d.metrics.SetVolumeConnections(r.Name, v.Connections)
+	d.metrics.SetVolumesMounted(countMounted(d.volumes))
 	d.saveState()
 
 	return &volume.MountResponse{Mountpoint: v.SubdirMountpoint}, nil
@@ -378,12 +402,21 @@ func (d *glusterfsDriver) Unmount(r *volume.UnmountRequest) error {
 
 	if v.Connections <= 0 {
 		v.Connections = 0
+		start := time.Now()
 		if err := d.unmountVolume(v.Mountpoint); err != nil {
+			d.metrics.ObserveMountDuration("unmount", time.Since(start))
+			d.metrics.IncMountOps("unmount", "error")
+			d.metrics.IncMountError(classifyError(err))
 			// Log error but don't fail - mount might already be gone
 			logrus.WithField("volume", r.Name).Warnf("unmount error (may be already unmounted): %v", err)
+		} else {
+			d.metrics.ObserveMountDuration("unmount", time.Since(start))
+			d.metrics.IncMountOps("unmount", "success")
 		}
 	}
 
+	d.metrics.SetVolumeConnections(r.Name, v.Connections)
+	d.metrics.SetVolumesMounted(countMounted(d.volumes))
 	d.saveState()
 	return nil
 }
@@ -498,6 +531,30 @@ func (d *glusterfsDriver) unmountVolume(target string) error {
 	return nil
 }
 
+func classifyError(err error) string {
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "connection") || strings.Contains(msg, "transport endpoint"):
+		return "connection"
+	case strings.Contains(msg, "timed out") || strings.Contains(msg, "timeout"):
+		return "timeout"
+	case strings.Contains(msg, "busy"):
+		return "busy"
+	default:
+		return "other"
+	}
+}
+
+func countMounted(volumes map[string]*glusterfsVolume) int {
+	count := 0
+	for _, v := range volumes {
+		if v.Connections > 0 {
+			count++
+		}
+	}
+	return count
+}
+
 func logError(format string, args ...interface{}) error {
 	logrus.Errorf(format, args...)
 	return fmt.Errorf(format, args...)
@@ -518,7 +575,19 @@ func main() {
 		cleanupInterval = time.Duration(secs) * time.Second
 	}
 
-	d, err := newGlusterfsDriver("/mnt/volumes", os.Getenv("SERVERS"), os.Getenv("VOLNAME"), cleanupInterval)
+	metricsEnabled, _ := strconv.ParseBool(os.Getenv("METRICS_ENABLED"))
+	metricsPort := 9713
+	if envVal := os.Getenv("METRICS_PORT"); envVal != "" {
+		p, err := strconv.Atoi(envVal)
+		if err != nil || p < 1 || p > 65535 {
+			log.Fatalf("invalid METRICS_PORT value %q: must be 1-65535", envVal)
+		}
+		metricsPort = p
+	}
+
+	rec := metrics.NewRecorder(metricsEnabled, metricsPort)
+
+	d, err := newGlusterfsDriver("/mnt/volumes", os.Getenv("SERVERS"), os.Getenv("VOLNAME"), cleanupInterval, rec)
 	if err != nil {
 		log.Fatal(err)
 	}
